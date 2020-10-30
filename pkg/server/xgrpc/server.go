@@ -18,9 +18,8 @@ import (
 	"context"
 	"net"
 
-	"github.com/douyu/jupiter/pkg"
+	"github.com/douyu/jupiter/pkg/constant"
 	"github.com/douyu/jupiter/pkg/ecode"
-
 	"github.com/douyu/jupiter/pkg/server"
 	"github.com/douyu/jupiter/pkg/xlog"
 	"google.golang.org/grpc"
@@ -34,23 +33,39 @@ type Server struct {
 }
 
 func newServer(config *Config) *Server {
-	if len(config.streamInterceptors) > 0 {
-		config.serverOptions = append(config.serverOptions, grpc.StreamInterceptor(StreamInterceptorChain(config.streamInterceptors...)))
-	}
-	if len(config.unaryInterceptors) > 0 {
-		config.serverOptions = append(config.serverOptions, grpc.UnaryInterceptor(UnaryInterceptorChain(config.unaryInterceptors...)))
-	}
+	var streamInterceptors = append(
+		[]grpc.StreamServerInterceptor{defaultStreamServerInterceptor(config.logger, config.SlowQueryThresholdInMilli)},
+		config.streamInterceptors...,
+	)
+
+	var unaryInterceptors = append(
+		[]grpc.UnaryServerInterceptor{defaultUnaryServerInterceptor(config.logger, config.SlowQueryThresholdInMilli)},
+		config.unaryInterceptors...,
+	)
+
+	config.serverOptions = append(config.serverOptions,
+		grpc.StreamInterceptor(StreamInterceptorChain(streamInterceptors...)),
+		grpc.UnaryInterceptor(UnaryInterceptorChain(unaryInterceptors...)),
+	)
+
 	newServer := grpc.NewServer(config.serverOptions...)
 	listener, err := net.Listen(config.Network, config.Address())
 	if err != nil {
 		config.logger.Panic("new grpc server err", xlog.FieldErrKind(ecode.ErrKindListenErr), xlog.FieldErr(err))
 	}
-	return &Server{Server: newServer, listener: listener, Config: config}
+	config.Port = listener.Addr().(*net.TCPAddr).Port
+
+	return &Server{
+		Server:   newServer,
+		listener: listener,
+		Config:   config,
+	}
 }
 
 // Server implements server.Server interface.
 func (s *Server) Serve() error {
-	return s.Server.Serve(s.listener)
+	err := s.Server.Serve(s.listener)
+	return err
 }
 
 // Stop implements server.Server interface
@@ -68,19 +83,16 @@ func (s *Server) GracefulStop(ctx context.Context) error {
 }
 
 // Info returns server info, used by governor and consumer balancer
-// TODO(gorexlv): implements government protocol with juno
 func (s *Server) Info() *server.ServiceInfo {
-	return &server.ServiceInfo{
-		Name:      pkg.Name(),
-		Scheme:    "grpc",
-		IP:        s.Host,
-		Port:      s.Port,
-		Weight:    0.0,
-		Enable:    true,
-		Healthy:   true,
-		Metadata:  map[string]string{},
-		Region:    "",
-		Zone:      "",
-		GroupName: "",
+	serviceAddress := s.listener.Addr().String()
+	if s.Config.ServiceAddress != "" {
+		serviceAddress = s.Config.ServiceAddress
 	}
+
+	info := server.ApplyOptions(
+		server.WithScheme("grpc"),
+		server.WithAddress(serviceAddress),
+		server.WithKind(constant.ServiceProvider),
+	)
+	return &info
 }
